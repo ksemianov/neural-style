@@ -21,6 +21,7 @@ cmd:option('-multigpu_strategy', '', 'Index of layers to split the network acros
 -- Optimization options
 cmd:option('-content_weight', 5e0)
 cmd:option('-style_weight', 1e2)
+cmd:option('-histogram_weight', 0)
 cmd:option('-tv_weight', 1e-3)
 cmd:option('-num_iterations', 1000)
 cmd:option('-normalize_gradients', false)
@@ -47,6 +48,7 @@ cmd:option('-seed', -1)
 
 cmd:option('-content_layers', 'relu4_2', 'layers for content')
 cmd:option('-style_layers', 'relu1_1,relu2_1,relu3_1,relu4_1,relu5_1', 'layers for style')
+cmd:option('-histogram_layers', 'relu1_1,relu4_1', 'layers for histogram')
 
 
 local function main(params)
@@ -59,6 +61,11 @@ local function main(params)
   local content_image = image.load(params.content_image, 3)
   content_image = image.scale(content_image, params.image_size, 'bilinear')
   local content_image_caffe = preprocess(content_image):float()
+    
+  local hist_image_list = params.style_image:split(',')
+  local hist_image = image.load(hist_image_list[1], 3)
+  hist_image = image.scale(hist_image, (#content_image)[3], (#content_image)[2])
+  local hist_image_caffe = preprocess(hist_image):float()
 
   local style_size = math.ceil(params.style_scale * params.image_size)
   local style_image_list = params.style_image:split(',')
@@ -69,6 +76,8 @@ local function main(params)
     local img_caffe = preprocess(img):float()
     table.insert(style_images_caffe, img_caffe)
   end
+  
+  
 
   local init_image = nil
   if params.init_image ~= '' then
@@ -103,17 +112,18 @@ local function main(params)
 
   local content_layers = params.content_layers:split(",")
   local style_layers = params.style_layers:split(",")
+  local histogram_layers = params.histogram_layers:split(",")
 
   -- Set up the network, inserting style and content loss modules
-  local content_losses, style_losses = {}, {}
-  local next_content_idx, next_style_idx = 1, 1
+  local content_losses, style_losses, histogram_losses = {}, {}, {}
+  local next_content_idx, next_style_idx, next_histogram_idx = 1, 1, 1
   local net = nn.Sequential()
   if params.tv_weight > 0 then
     local tv_mod = nn.TVLoss(params.tv_weight):type(dtype)
     net:add(tv_mod)
   end
   for i = 1, #cnn do
-    if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
+    if next_content_idx <= #content_layers or next_style_idx <= #style_layers or next_histogram_idx <= #histogram_layers then
       local layer = cnn:get(i)
       local name = layer.name
       local layer_type = torch.type(layer)
@@ -136,6 +146,40 @@ local function main(params)
         net:add(loss_module)
         table.insert(content_losses, loss_module)
         next_content_idx = next_content_idx + 1
+      end
+      if name == histogram_layers[next_histogram_idx] then
+        print("Setting up histogram layer", i, ":", layer.name)
+        local input_features = net:forward(content_image_caffe:type(dtype)):clone():float()
+        local target_features = net:forward(hist_image_caffe:type(dtype)):clone():float()
+        sizes = #input_features
+        input_features = input_features:reshape(sizes[1],sizes[2]*sizes[3])
+        target_features = target_features:reshape(sizes[1],sizes[2]*sizes[3])
+        local input_features_remaped = input_features:clone()
+          for j=1,sizes[1] do
+            local nbins = 64
+            local input_hist = torch.cumsum(torch.histc(input_features[{j}], nbins, 0, 1):div(nbins))
+            local target_hist = torch.cumsum(torch.histc(target_features[{j}], nbins, 0, 1):div(nbins))
+
+            local function Match(x)
+              local input_bin = math.min(math.max(math.floor(x * nbins), 1), nbins)
+              local input_dens = input_hist[input_bin]
+              local target_bin = 1
+              for i=1,nbins do
+                if (target_hist[i] < input_dens) then
+                  target_bin = i
+                end
+              end
+              return target_bin / nbins
+            end
+
+            input_features_remaped[{j}] = input_features_remaped[{j}]:apply(Match)
+          end
+
+        local loss_module = nn.HistogramLoss(params.histogram_weight, input_features_remaped:type(dtype):resize(sizes[1],sizes[2],sizes[3]), false):type(dtype)
+        
+        net:add(loss_module)
+        table.insert(histogram_losses, loss_module)
+        next_histogram_idx = next_histogram_idx + 1
       end
       if name == style_layers[next_style_idx] then
         print("Setting up style layer  ", i, ":", layer.name)
@@ -160,7 +204,7 @@ local function main(params)
   print(net)
   content_image_caffe = content_image_caffe:type(dtype)
   net:forward(content_image_caffe:type(dtype))
-
+    
   -- Capture style targets
   for i = 1, #content_losses do
     content_losses[i].mode = 'none'
@@ -245,6 +289,9 @@ local function main(params)
       for i, loss_module in ipairs(content_losses) do
         print(string.format('  Content %d loss: %f', i, loss_module.loss))
       end
+      for i, loss_module in ipairs(histogram_losses) do
+        print(string.format('  Histogram %d loss: %f', i, loss_module.loss))
+      end
       for i, loss_module in ipairs(style_losses) do
         print(string.format('  Style %d loss: %f', i, loss_module.loss))
       end
@@ -287,6 +334,9 @@ local function main(params)
       loss = loss + mod.loss
     end
     for _, mod in ipairs(style_losses) do
+      loss = loss + mod.loss
+    end
+    for _, mod in ipairs(histogram_losses) do
       loss = loss + mod.loss
     end
     maybe_print(num_calls, loss)
@@ -482,6 +532,42 @@ function ContentLoss:updateGradInput(input, gradOutput)
   else
     self.gradInput:resizeAs(gradOutput):copy(gradOutput)
   end
+  return self.gradInput
+end
+
+
+-- Define an nn Module to compute histogram loss in-place
+local HistogramLoss, parent = torch.class('nn.HistogramLoss', 'nn.Module')
+
+function HistogramLoss:__init(strength, target, normalize)
+  parent.__init(self)
+  self.strength = strength
+  self.target = target
+  self.normalize = normalize or false
+  self.loss = 0
+  self.crit = nn.MSECriterion()
+end
+
+function HistogramLoss:updateOutput(input)
+  if input:nElement() == self.target:nElement() then
+    self.loss = self.crit:forward(input, self.target) * self.strength
+  else
+    print('WARNING: Skipping histogram loss')
+    print(#input, #self.target)
+  end
+  self.output = input
+  return self.output
+end
+
+function HistogramLoss:updateGradInput(input, gradOutput)
+  if input:nElement() == self.target:nElement() then
+    self.gradInput = self.crit:backward(input, self.target)
+  end
+  if self.normalize then
+    self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
+  end
+  self.gradInput:mul(self.strength)
+  self.gradInput:add(gradOutput)
   return self.gradInput
 end
 
