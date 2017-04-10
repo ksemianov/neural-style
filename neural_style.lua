@@ -19,11 +19,12 @@ cmd:option('-gpu', '0', 'Zero-indexed ID of the GPU to use; for CPU mode set -gp
 cmd:option('-multigpu_strategy', '', 'Index of layers to split the network across GPUs')
 
 -- Optimization options
-cmd:option('-content_weight', 5e0)
+cmd:option('-content_weight', 1e1)
 cmd:option('-style_weight', 1e2)
-cmd:option('-histogram_weight', 0)
+cmd:option('-histogram_weight', 5e2)
+cmd:option('-matching_nbins', 64)
 cmd:option('-tv_weight', 1e-3)
-cmd:option('-num_iterations', 1000)
+cmd:option('-num_iterations', 1001)
 cmd:option('-normalize_gradients', false)
 cmd:option('-init', 'random', 'random|image')
 cmd:option('-init_image', '')
@@ -48,7 +49,7 @@ cmd:option('-seed', -1)
 
 cmd:option('-content_layers', 'relu4_2', 'layers for content')
 cmd:option('-style_layers', 'relu1_1,relu2_1,relu3_1,relu4_1,relu5_1', 'layers for style')
-cmd:option('-histogram_layers', 'relu1_1,relu4_1', 'layers for histogram')
+cmd:option('-histogram_layers', 'relu1_1,relu5_1', 'layers for histogram')
 
 
 local function main(params)
@@ -154,28 +155,36 @@ local function main(params)
         sizes = #input_features
         input_features = input_features:reshape(sizes[1],sizes[2]*sizes[3])
         target_features = target_features:reshape(sizes[1],sizes[2]*sizes[3])
+
         local input_features_remaped = input_features:clone()
           for j=1,sizes[1] do
-            local nbins = 64
+            local nbins = params.matching_nbins
             local input_hist = torch.cumsum(torch.histc(input_features[{j}], nbins, 0, 1):div(nbins))
             local target_hist = torch.cumsum(torch.histc(target_features[{j}], nbins, 0, 1):div(nbins))
 
             local function Match(x)
               local input_bin = math.min(math.max(math.floor(x * nbins), 1), nbins)
               local input_dens = input_hist[input_bin]
-              local target_bin = 1
-              for i=1,nbins do
-                if (target_hist[i] < input_dens) then
-                  target_bin = i
+              local l = 1
+              local r = nbins + 1
+              local m
+              while (r - l > 1) do
+                m = math.floor((l + r) / 2)
+                if (target_hist[m] <= input_dens) then
+                  l = m
+                else
+                  r = m
                 end
               end
-              return target_bin / nbins
-            end
 
+              return l / nbins
+            end
+            
             input_features_remaped[{j}] = input_features_remaped[{j}]:apply(Match)
           end
 
-        local loss_module = nn.HistogramLoss(params.histogram_weight, input_features_remaped:type(dtype):resize(sizes[1],sizes[2],sizes[3]), false):type(dtype)
+        local loss_module = nn.HistogramLoss(params.histogram_weight,
+	input_features_remaped:type(dtype):resize(sizes[1],sizes[2],sizes[3]), false):type(dtype)
         
         net:add(loss_module)
         table.insert(histogram_losses, loss_module)
